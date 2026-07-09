@@ -30,7 +30,7 @@ app.post('/api/receta', async (req, res) => {
     console.log('API Key configurada:', GEMINI_KEY ? 'SI (' + GEMINI_KEY.substring(0,8) + '...)' : 'NO');
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
