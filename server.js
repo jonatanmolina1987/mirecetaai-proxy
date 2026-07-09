@@ -7,9 +7,9 @@ app.use(express.json({ limit: '10mb' }));
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 
-const systemPrompt = `Eres MiRecetaAI, un chef latinoamericano experto. Dame una receta con estos ingredientes.
+const systemPrompt = `Eres MiRecetaAI, un chef latinoamericano. Dame una receta corta con estos ingredientes.
 
-Formato EXACTO que debes usar:
+Formato:
 RECETA: [nombre con emoji]
 INGREDIENTES:
 - ingrediente 1
@@ -18,56 +18,65 @@ PASOS:
 1. paso uno
 2. paso dos
 3. paso tres
-TIP: consejo util del chef
-PRESENTACION: descripcion visual del plato
+TIP: consejo util
+PRESENTACION: descripcion visual
 
-Maximo 300 palabras. Espanol latinoamericano.`;
+Maximo 200 palabras. Espanol latinoamericano.`;
 
 app.post('/api/receta', async (req, res) => {
   try {
     const { ingredients } = req.body;
-    console.log('Request recibido - ingredientes:', ingredients);
-    console.log('API Key configurada:', GEMINI_KEY ? 'SI (' + GEMINI_KEY.substring(0,8) + '...)' : 'NO');
+    console.log('Ingredientes:', ingredients);
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{
-            parts: [{ text: systemPrompt + '\n\nIngredientes disponibles: ' + ingredients }]
+            parts: [{ text: systemPrompt + '\n\nIngredientes: ' + ingredients }]
           }],
-          generationConfig: { maxOutputTokens: 1024, temperature: 0.7 }
+          generationConfig: {
+            maxOutputTokens: 512,
+            temperature: 0.7
+          }
         })
       }
     );
 
-    const data = await response.json();
-    console.log('HTTP Status de Gemini:', response.status);
+    const rawText = await response.text();
+    console.log('Status:', response.status);
+    console.log('Raw response:', rawText.substring(0, 300));
+
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
+      console.error('JSON parse error:', e.message);
+      return res.json({ content: [{ type: 'text', text: 'Error parsing: ' + rawText.substring(0, 100) }] });
+    }
 
     if (!response.ok) {
-      console.error('Error Gemini:', JSON.stringify(data));
-      return res.json({ content: [{ type: 'text', text: 'Error Gemini ' + response.status + ': ' + JSON.stringify(data.error?.message || data) }] });
+      return res.json({ content: [{ type: 'text', text: 'Error ' + response.status + ': ' + (data.error?.message || rawText.substring(0, 100)) }] });
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     if (!text) {
-      console.error('Sin texto. Data:', JSON.stringify(data).substring(0,500));
-      return res.json({ content: [{ type: 'text', text: 'Sin respuesta de Gemini: ' + JSON.stringify(data).substring(0,200) }] });
+      return res.json({ content: [{ type: 'text', text: 'Sin texto: ' + rawText.substring(0, 200) }] });
     }
 
-    console.log('Receta generada OK, chars:', text.length);
+    console.log('OK - chars:', text.length);
     res.json({ content: [{ type: 'text', text }] });
 
   } catch (err) {
-    console.error('Error catch:', err.message);
-    res.json({ content: [{ type: 'text', text: 'Error: ' + err.message }] });
+    console.error('Error:', err.message);
+    res.json({ content: [{ type: 'text', text: 'Error servidor: ' + err.message }] });
   }
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', hasKey: !!GEMINI_KEY, keyStart: GEMINI_KEY ? GEMINI_KEY.substring(0,8) : 'none' });
+  res.json({ status: 'ok', hasKey: !!GEMINI_KEY });
 });
 
 const PORT = process.env.PORT || 3000;
