@@ -11,15 +11,19 @@ app.post('/api/receta', async (req, res) => {
   console.log('=== Petición recibida en /api/receta ===');
   console.log('Body:', JSON.stringify(req.body));
   try {
-    const { ingredientes } = req.body;
-    console.log('Ingredientes:', ingredientes);
+    const { ingredients, systemPrompt } = req.body;
+    console.log('Ingredientes:', ingredients);
     console.log('Llave presente:', KEY ? 'SI (' + KEY.substring(0,6) + '...)' : 'NO - LLAVE VACIA');
+
+    const promptFinal = systemPrompt
+      ? `${systemPrompt}\n\nIngredientes disponibles: ${ingredients}`
+      : `Eres un chef latinoamericano. Crea una receta con estos ingredientes: ${ingredients}. Formatea la respuesta de manera clara.`;
 
     const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: `Eres un chef latinoamericano. Crea una receta con estos ingredientes: ${ingredientes}. Formatea la respuesta de manera clara.` }] }]
+        contents: [{ parts: [{ text: promptFinal }] }]
       })
     });
     console.log('Status de respuesta de Gemini:', r.status);
