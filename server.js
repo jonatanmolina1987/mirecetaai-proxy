@@ -29,11 +29,35 @@ app.post('/api/receta', async (req, res) => {
     console.log('Status de respuesta de Gemini:', r.status);
     const d = await r.json();
     console.log('Respuesta cruda de Gemini:', JSON.stringify(d).substring(0, 500));
-    const texto = d?.candidates?.[0]?.content?.parts?.[0]?.text || 'Sin respuesta: ' + JSON.stringify(d).substring(0, 100);
-    res.json({ contenido: [{ tipo: 'texto', texto }] });
+
+    // Si Gemini devolvió un error, damos un mensaje amigable en vez del JSON crudo
+    if (d.error) {
+      const code = d.error.code;
+      let mensajeAmigable;
+
+      if (code === 503 || code === 429) {
+        // Alta demanda / rate limit
+        mensajeAmigable = "⏳ ¡Vaya! Hay muchos usuarios generando recetas en este momento. No te preocupes, no pasa nada raro con la app — espera un par de minutos y vuelve a intentarlo. 🍽️";
+      } else if (code === 404) {
+        mensajeAmigable = "🔧 Estamos ajustando algo por detrás. Intenta de nuevo en unos minutos.";
+      } else if (code === 400) {
+        mensajeAmigable = "🤔 No entendí bien esos ingredientes. Intenta escribirlos de otra forma o agrega uno más.";
+      } else {
+        mensajeAmigable = "😅 Tuvimos un pequeño inconveniente generando tu receta. Intenta de nuevo en un momento.";
+      }
+
+      console.log('Error de Gemini detectado, enviando mensaje amigable al usuario');
+      return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: mensajeAmigable }] });
+    }
+
+    const texto = d?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!texto) {
+      return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: "😅 No pudimos generar tu receta esta vez. Intenta de nuevo en un momento." }] });
+    }
+    res.json({ esError: false, contenido: [{ tipo: 'texto', texto }] });
   } catch (mi) {
     console.log('ERROR CAPTURADO:', mi.message);
-    res.json({ contenido: [{ tipo: 'texto', texto: 'Error: ' + mi.message }] });
+    res.json({ esError: true, contenido: [{ tipo: 'texto', texto: '😅 Tuvimos un problema de conexión. Por favor intenta de nuevo en un momento.' }] });
   }
 });
 
