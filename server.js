@@ -7,9 +7,12 @@ app.use(express.json());
 
 const KEY = process.env.GEMINI_API_KEY || '';
 
-// ---------- Firebase Admin para el banco de recetas ----------
+// ---------- NUEVO: Firebase Admin para el banco de recetas ----------
 const admin = require('firebase-admin');
 
+// En Render, guarda el JSON completo del service account en una variable
+// de entorno llamada FIREBASE_SERVICE_ACCOUNT (como texto plano, todo en una línea).
+// Se descarga desde: Firebase Console > Configuración del proyecto > Cuentas de servicio > Generar nueva clave privada.
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
 
 if (!admin.apps.length) {
@@ -32,6 +35,8 @@ function normalizeText(text) {
     .replace(/\s+/g, ' ');
 }
 
+// El ingredientsKey se calcula a partir del string de ingredientes que manda el cliente
+// (ej: "pollo, arroz, cebolla" -> ordenado y normalizado)
 function ingredientsKey(ingredientsString) {
   return ingredientsString
     .split(',')
@@ -65,19 +70,35 @@ function isSimilarName(nameA, nameB, threshold = 0.82) {
   return maxLen > 0 && 1 - dist / maxLen >= threshold;
 }
 
+// Extrae un nombre de receta aproximado del texto que devuelve Gemini
+// (asume que la primera línea suele ser el título/nombre de la receta)
 function extraerNombre(texto) {
   const primeraLinea = texto.split('\n').find((l) => l.trim().length > 0) || '';
   return primeraLinea.replace(/[*#]/g, '').trim().substring(0, 120);
 }
 
-// ---------- Banco de recetas ----------
+// ---------- Paso 1: buscar en el banco antes de llamar a Gemini ----------
 
-async function buscarEnBanco(uid, ingredientsString) {
-  const key = ingredientsKey(ingredientsString);
+// El banco tiene 3 "cajones" separados para que nunca se mezclen categorías:
+// - normal: el generador principal por ingredientes (recipes_bank, clave = ingredientes)
+// - salud: todo "Cuidamos tu salud" (recipes_bank_salud, clave = categoria exacta,
+//   ej. "salud_desayuno", "salud_bebida_dietetica" — cada una en su propio cajón)
+// - bebidas: "Bebidas, jugos y cócteles" Pro (recipes_bank_bebidas, clave = categoria)
+// Antes todas estas categorías compartían la misma clave (un texto de relleno fijo),
+// por eso el banco servía comida donde debía servir una bebida.
+function bankConfig(categoria) {
+  if (!categoria) return { collection: 'recipes_bank', keyField: 'ingredientsKey' };
+  if (categoria.startsWith('bebida_pro')) return { collection: 'recipes_bank_bebidas', keyField: 'categoria' };
+  return { collection: 'recipes_bank_salud', keyField: 'categoria' };
+}
+
+async function buscarEnBanco(uid, ingredientsString, categoria) {
+  const { collection, keyField } = bankConfig(categoria);
+  const key = categoria || ingredientsKey(ingredientsString);
 
   const snapshot = await db
-    .collection('recipes_bank')
-    .where('ingredientsKey', '==', key)
+    .collection(collection)
+    .where(keyField, '==', key)
     .limit(20)
     .get();
 
@@ -101,10 +122,26 @@ async function marcarComoVista(uid, recipeId) {
     .set({ shownAt: FieldValue.serverTimestamp() });
 }
 
-async function esDuplicadaEnBanco(nombre, ingredientsString) {
+async function esDuplicadaEnBanco(nombre, ingredientsString, categoria) {
+  const { collection, keyField } = bankConfig(categoria);
+
+  // Para "Cuidamos tu salud" y "Bebidas Pro", el chequeo de duplicados cruza AMBAS
+  // colecciones (no solo la propia categoría) — así un usuario nunca recibe la misma
+  // receta tanto en, por ejemplo, "bebida dietética" como en "Bebidas Pro: jugo".
+  if (keyField === 'categoria') {
+    const colecciones = ['recipes_bank_salud', 'recipes_bank_bebidas'];
+    for (const col of colecciones) {
+      const snap = await db.collection(col).orderBy('createdAt', 'desc').limit(30).get();
+      for (const doc of snap.docs) {
+        if (isSimilarName(doc.data().name, nombre)) return true;
+      }
+    }
+    return false;
+  }
+
   const key = ingredientsKey(ingredientsString);
-  const exacto = await db.collection('recipes_bank')
-    .where('ingredientsKey', '==', key).limit(5).get();
+  const exacto = await db.collection(collection)
+    .where(keyField, '==', key).limit(5).get();
 
   for (const doc of exacto.docs) {
     if (isSimilarName(doc.data().name, nombre)) return true;
@@ -112,19 +149,25 @@ async function esDuplicadaEnBanco(nombre, ingredientsString) {
   return false;
 }
 
-async function guardarEnBanco({ nombre, texto, ingredientsString }) {
-  const docRef = await db.collection('recipes_bank').add({
+async function guardarEnBanco({ nombre, texto, ingredientsString, categoria }) {
+  const { collection, keyField } = bankConfig(categoria);
+  const doc = {
     name: nombre,
-    ingredientsKey: ingredientsKey(ingredientsString),
-    ingredientsRaw: ingredientsString,
     contenido: texto,
     createdAt: FieldValue.serverTimestamp(),
     timesServed: 1,
-  });
+  };
+  if (keyField === 'ingredientsKey') {
+    doc.ingredientsKey = ingredientsKey(ingredientsString);
+    doc.ingredientsRaw = ingredientsString;
+  } else {
+    doc.categoria = categoria;
+  }
+  const docRef = await db.collection(collection).add(doc);
   return docRef.id;
 }
 
-// ---------- Lógica original de llamada a Gemini ----------
+// ---------- Lógica original de llamada a Gemini (sin cambios) ----------
 
 const MODELOS = ['gemini-flash-lite-latest', 'gemini-flash-latest'];
 const INTENTOS_POR_MODELO = 2;
@@ -164,21 +207,23 @@ async function generarConReintentos(promptFinal) {
   return ultimo;
 }
 
-// ---------- Endpoint principal, con banco de recetas ----------
+// ---------- Endpoint principal, ahora con banco de recetas ----------
 
 app.post('/api/receta', async (req, res) => {
   console.log('=== Petición recibida en /api/receta ===');
   console.log('Body:', JSON.stringify(req.body));
   try {
-    const { ingredients, systemPrompt, uid } = req.body;
-    console.log('Ingredientes:', ingredients, '| uid:', uid);
+    const { ingredients, systemPrompt, uid, categoria } = req.body;
+    console.log('Ingredientes:', ingredients, '| uid:', uid, '| categoria:', categoria);
 
+    // Si no llega uid (ej. mientras actualizas la app), usamos el flujo viejo sin banco
     if (uid) {
-      const delBanco = await buscarEnBanco(uid, ingredients);
+      const delBanco = await buscarEnBanco(uid, ingredients, categoria);
       if (delBanco) {
         console.log('Receta servida desde el banco, sin llamar a Gemini');
         await marcarComoVista(uid, delBanco.id);
-        await db.collection('recipes_bank').doc(delBanco.id)
+        const { collection } = bankConfig(categoria);
+        await db.collection(collection).doc(delBanco.id)
           .update({ timesServed: FieldValue.increment(1) });
         return res.json({ esError: false, contenido: [{ tipo: 'texto', texto: delBanco.contenido }] });
       }
@@ -222,14 +267,15 @@ app.post('/api/receta', async (req, res) => {
       const nombre = extraerNombre(candidato);
 
       if (!uid) {
+        // Sin uid no podemos chequear el banco por usuario; se sirve directo (comportamiento viejo)
         texto = candidato;
         break;
       }
 
-      const duplicada = await esDuplicadaEnBanco(nombre, ingredients);
+      const duplicada = await esDuplicadaEnBanco(nombre, ingredients, categoria);
       if (!duplicada) {
         texto = candidato;
-        await guardarEnBanco({ nombre, texto: candidato, ingredientsString: ingredients });
+        await guardarEnBanco({ nombre, texto: candidato, ingredientsString: ingredients, categoria });
         break;
       }
 
