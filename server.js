@@ -1,18 +1,33 @@
+process.env.TZ = 'UTC'; // el servidor calcula la fecha de Ecuador a mano (ver hoyTexto)
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const app = express();
 
+app.set('trust proxy', true); // Render está detrás de un proxy: así req.ip es la IP real
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '64kb' }));
 
 const KEY = process.env.GEMINI_API_KEY || '';
 
-// ---------- NUEVO: Firebase Admin para el banco de recetas ----------
+// ---------- Configuración de seguridad y límites ----------
+const OWNER_EMAIL = 'jproducer.ec@gmail.com';
+const FREE_LIMIT = 3;            // recetas gratis por día (igual que en la app)
+const MAX_ADS_PER_DAY = 5;       // anuncios con recompensa por día (igual que en la app)
+const RC_ENTITLEMENT = 'pro';
+const RC_SECRET = process.env.REVENUECAT_SECRET_KEY || '';
+// Fase 1: "si" (por defecto) = las versiones viejas de la app (sin token) siguen funcionando.
+// Fase 2: pon PERMITIR_APPS_VIEJAS = no en Render cuando todos hayan actualizado.
+const PERMITIR_APPS_VIEJAS = (process.env.PERMITIR_APPS_VIEJAS || 'si') !== 'no';
+// "no" (por defecto) = se acepta el aviso de la app de que vio el anuncio (con tope diario).
+// "si" = solo cuenta el aviso firmado por Google (AdMob SSV). Actívalo cuando lo configures.
+const ANUNCIOS_VERIFICADOS = (process.env.ANUNCIOS_VERIFICADOS || 'no') === 'si';
+
+// ---------- Firebase Admin ----------
 const admin = require('firebase-admin');
 
 // En Render, guarda el JSON completo del service account en una variable
 // de entorno llamada FIREBASE_SERVICE_ACCOUNT (como texto plano, todo en una línea).
-// Se descarga desde: Firebase Console > Configuración del proyecto > Cuentas de servicio > Generar nueva clave privada.
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
 
 if (!admin.apps.length) {
@@ -207,16 +222,277 @@ async function generarConReintentos(promptFinal) {
   return ultimo;
 }
 
-// ---------- Endpoint principal, ahora con banco de recetas ----------
+// =====================================================================
+// SEGURIDAD: identidad, Pro, límite diario y anuncios
+// =====================================================================
+
+// Fecha de "hoy" en Ecuador (UTC-5), en el mismo formato que usa la app (toDateString).
+function hoyTexto() {
+  return new Date(Date.now() - 5 * 3600 * 1000).toDateString();
+}
+
+// Lee el token de Firebase del encabezado Authorization.
+// Devuelve: null si no vino token, { error } si vino pero es inválido, o los datos del usuario.
+async function leerSesion(req) {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) return null;
+  try {
+    const t = await admin.auth().verifyIdToken(h.slice(7));
+    return { uid: t.uid, email: (t.email || '').toLowerCase(), verificado: t.email_verified === true };
+  } catch (e) {
+    console.log('Token inválido:', e.code || e.message);
+    return { error: true };
+  }
+}
+
+function esDueno(sesion) {
+  return !!sesion && sesion.verificado && sesion.email === OWNER_EMAIL;
+}
+
+// Consulta a RevenueCat si el usuario tiene "pro" activo. Guarda el resultado 10 min.
+// Funciona con claves secretas V1 o V2 de RevenueCat (V2 necesita REVENUECAT_PROJECT_ID).
+const RC_PROJECT = process.env.REVENUECAT_PROJECT_ID || '';
+const cachePro = new Map();
+let idEntitlementV2 = null;
+
+async function proConV1(uid) {
+  const r = await fetch(`https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(uid)}`, {
+    headers: { Authorization: `Bearer ${RC_SECRET}` },
+  });
+  if (!r.ok) { const e = new Error('RevenueCat v1 status ' + r.status); e.status = r.status; throw e; }
+  const d = await r.json();
+  const ent = d?.subscriber?.entitlements?.[RC_ENTITLEMENT];
+  return !!ent && (!ent.expires_date || new Date(ent.expires_date).getTime() > Date.now());
+}
+
+async function proConV2(uid) {
+  const base = `https://api.revenuecat.com/v2/projects/${encodeURIComponent(RC_PROJECT)}`;
+  const h = { Authorization: `Bearer ${RC_SECRET}` };
+  if (!idEntitlementV2) {
+    const r = await fetch(`${base}/entitlements?limit=100`, { headers: h });
+    if (!r.ok) throw new Error('RevenueCat v2 entitlements status ' + r.status);
+    const d = await r.json();
+    const ent = (d.items || []).find((e) => e.lookup_key === RC_ENTITLEMENT);
+    if (!ent) throw new Error(`No existe el entitlement "${RC_ENTITLEMENT}" en RevenueCat`);
+    idEntitlementV2 = ent.id;
+  }
+  const r = await fetch(`${base}/customers/${encodeURIComponent(uid)}/active_entitlements?limit=100`, { headers: h });
+  if (r.status === 404) return false; // cliente que nunca compró
+  if (!r.ok) throw new Error('RevenueCat v2 status ' + r.status);
+  const d = await r.json();
+  return (d.items || []).some((e) => e.entitlement_id === idEntitlementV2
+    && (e.expires_at == null || Number(e.expires_at) > Date.now()));
+}
+
+async function esProReal(uid) {
+  const c = cachePro.get(uid);
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c.pro;
+  if (!RC_SECRET) { console.log('Falta REVENUECAT_SECRET_KEY en Render'); return c ? c.pro : false; }
+  try {
+    let pro;
+    if (RC_PROJECT) {
+      pro = await proConV2(uid);
+    } else {
+      pro = await proConV1(uid);
+    }
+    cachePro.set(uid, { pro, t: Date.now() });
+    return pro;
+  } catch (e) {
+    console.log('No se pudo consultar RevenueCat:', e.message);
+    return c ? c.pro : false; // si RevenueCat falla, usamos el último dato conocido
+  }
+}
+
+// Categorías que solo puede pedir un usuario Pro (igual que en la app).
+function esCategoriaPro(categoria) {
+  if (!categoria) return false;
+  return categoria.startsWith('bebida_pro')
+    || categoria.startsWith('salud_bebida_')
+    || categoria === 'salud_bajarpeso_cena'
+    || categoria === 'salud_bajarpeso_bebida';
+}
+
+// Uso diario guardado en usage/{uid}. SOLO el servidor lo modifica.
+// Una "generación" (ej. el plan de bajar de peso = 2 a 4 recetas seguidas) es un "grupo":
+// se descuenta 1 receta al empezar el grupo, y si el grupo nunca tuvo éxito, se devuelve.
+const GRUPO_MAX_MS = 15 * 60 * 1000;
+const GRUPO_MAX_LLAMADAS = 30;
+
+function normalizarUso(u) {
+  const hoy = hoyTexto();
+  if (!u || u.date !== hoy) {
+    return { date: hoy, recipesUsed: 0, adsUsed: 0, extraEarned: 0, grupo: null };
+  }
+  u = { recipesUsed: 0, adsUsed: 0, extraEarned: 0, grupo: null, ...u };
+  // Grupo viejo que nunca tuvo éxito: se devuelve la receta descontada.
+  const g = u.grupo;
+  if (g && g.cobrado && !g.exito && Date.now() - g.desde > GRUPO_MAX_MS) {
+    u.recipesUsed = Math.max(0, u.recipesUsed - 1);
+    u.grupo = { ...g, cobrado: false };
+  }
+  return u;
+}
+
+function usoPublico(u, ilimitado) {
+  const limite = FREE_LIMIT + (u.extraEarned || 0);
+  return {
+    recipesUsed: u.recipesUsed || 0,
+    extraEarned: u.extraEarned || 0,
+    adsUsed: u.adsUsed || 0,
+    limite,
+    restantes: ilimitado ? 999 : Math.max(0, limite - (u.recipesUsed || 0)),
+    esPro: !!ilimitado,
+    date: u.date,
+  };
+}
+
+async function reservarReceta(uid, grupoId, ilimitado) {
+  const ref = db.collection('usage').doc(uid);
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    const u = normalizarUso(snap.exists ? snap.data() : null);
+    const ahora = Date.now();
+    let g = u.grupo;
+    const mismoGrupo = g && grupoId && g.id === grupoId
+      && ahora - g.desde < GRUPO_MAX_MS && (g.llamadas || 0) < GRUPO_MAX_LLAMADAS;
+
+    if (!mismoGrupo) {
+      // Si el grupo anterior se cobró y nunca funcionó, se devuelve antes de empezar otro.
+      if (g && g.cobrado && !g.exito) {
+        u.recipesUsed = Math.max(0, u.recipesUsed - 1);
+        g = { ...g, cobrado: false };
+        u.grupo = g;
+      }
+      if (!ilimitado && u.recipesUsed >= FREE_LIMIT + (u.extraEarned || 0)) {
+        t.set(ref, u); // se conserva el grupo en curso
+        return { ok: false, uso: usoPublico(u, ilimitado) };
+      }
+      g = { id: grupoId || crypto.randomUUID(), desde: ahora, llamadas: 0, exito: false, cobrado: !ilimitado };
+      if (!ilimitado) u.recipesUsed += 1;
+    }
+    g.llamadas = (g.llamadas || 0) + 1;
+    u.grupo = g;
+    t.set(ref, u);
+    return { ok: true, uso: usoPublico(u, ilimitado), grupoId: g.id };
+  });
+}
+
+async function marcarExito(uid, grupoId) {
+  const ref = db.collection('usage').doc(uid);
+  await db.runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    if (!snap.exists) return;
+    const u = snap.data();
+    if (u.grupo && u.grupo.id === grupoId && !u.grupo.exito) {
+      t.update(ref, { 'grupo.exito': true });
+    }
+  });
+}
+
+async function sumarAnuncio(uid, transaccionId) {
+  const ref = db.collection('usage').doc(uid);
+  const refTx = transaccionId ? ref.collection('anuncios').doc(transaccionId) : null;
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    if (refTx) {
+      const ya = await t.get(refTx);
+      if (ya.exists) return { ok: false, motivo: 'repetido' };
+    }
+    const u = normalizarUso(snap.exists ? snap.data() : null);
+    if ((u.adsUsed || 0) >= MAX_ADS_PER_DAY) { t.set(ref, u); return { ok: false, motivo: 'tope', uso: usoPublico(u, false) }; }
+    u.adsUsed = (u.adsUsed || 0) + 1;
+    u.extraEarned = (u.extraEarned || 0) + 1;
+    t.set(ref, u);
+    if (refTx) t.set(refTx, { fecha: FieldValue.serverTimestamp() });
+    return { ok: true, uso: usoPublico(u, false) };
+  });
+}
+
+// Freno para las versiones viejas de la app (sin token): máx. 20 pedidos por hora por IP.
+const pedidosPorIp = new Map();
+function ipExcedida(ip) {
+  const ahora = Date.now();
+  const r = pedidosPorIp.get(ip);
+  if (!r || ahora > r.reinicio) { pedidosPorIp.set(ip, { n: 1, reinicio: ahora + 3600 * 1000 }); return false; }
+  r.n += 1;
+  return r.n > 20;
+}
+setInterval(() => {
+  const ahora = Date.now();
+  for (const [ip, r] of pedidosPorIp) if (ahora > r.reinicio) pedidosPorIp.delete(ip);
+}, 10 * 60 * 1000).unref();
+
+function respuestaTexto(res, texto, extra = {}, status = 200) {
+  return res.status(status).json({ esError: true, contenido: [{ tipo: 'texto', texto }], ...extra });
+}
+
+// Solo aceptamos pedidos que realmente vienen de las instrucciones de MiRecetaAI,
+// para que nadie use este servidor como una IA gratis para otras cosas.
+function pedidoValido({ ingredients, systemPrompt, categoria }) {
+  if (typeof ingredients !== 'string' || ingredients.length === 0 || ingredients.length > 1500) return false;
+  if (systemPrompt !== undefined && systemPrompt !== null) {
+    if (typeof systemPrompt !== 'string' || systemPrompt.length > 15000) return false;
+    if (!systemPrompt.trimStart().startsWith('Eres MiRecetaAI')) return false;
+  }
+  if (categoria !== undefined && categoria !== null && categoria !== '') {
+    if (typeof categoria !== 'string' || !/^[a-z0-9_]{1,60}$/.test(categoria)) return false;
+  }
+  return true;
+}
+
+// ---------- Endpoint principal ----------
 
 app.post('/api/receta', async (req, res) => {
-  console.log('=== Petición recibida en /api/receta ===');
-  console.log('Body:', JSON.stringify(req.body));
-  try {
-    const { ingredients, systemPrompt, uid, categoria } = req.body;
-    console.log('Ingredientes:', ingredients, '| uid:', uid, '| categoria:', categoria);
+  const { ingredients, systemPrompt, categoria, grupo } = req.body || {};
+  console.log('=== /api/receta === categoria:', categoria || 'normal');
 
-    // Si no llega uid (ej. mientras actualizas la app), usamos el flujo viejo sin banco
+  if (!pedidoValido(req.body || {})) {
+    return respuestaTexto(res, '🤔 No pudimos procesar ese pedido. Actualiza la app e intenta de nuevo.', { codigo: 'INVALIDO' }, 400);
+  }
+
+  const sesion = await leerSesion(req);
+  if (sesion && sesion.error) {
+    return respuestaTexto(res, '🔒 Tu sesión expiró. Cierra sesión y vuelve a entrar para seguir cocinando.', { codigo: 'SESION' }, 401);
+  }
+
+  let uid = null;
+  let grupoId = null;
+  let usoActual = null;
+
+  if (sesion) {
+    // ---- App nueva: identidad verificada por Google ----
+    uid = sesion.uid;
+    const ilimitado = esDueno(sesion) || await esProReal(uid);
+
+    if (esCategoriaPro(categoria) && !ilimitado) {
+      return respuestaTexto(res, '👑 Esta función es exclusiva de Cocinero/a Pro.', { codigo: 'SOLO_PRO' }, 403);
+    }
+
+    const reserva = await reservarReceta(uid, typeof grupo === 'string' ? grupo.slice(0, 64) : null, ilimitado);
+    if (!reserva.ok) {
+      return respuestaTexto(res, '🍽️ Ya usaste tus recetas gratis de hoy. Mañana se renuevan solas.', { codigo: 'LIMITE', uso: reserva.uso }, 429);
+    }
+    grupoId = reserva.grupoId;
+    usoActual = reserva.uso;
+  } else {
+    // ---- App vieja (sin token) ----
+    if (!PERMITIR_APPS_VIEJAS) {
+      return respuestaTexto(res, '📲 Hay una nueva versión de MiRecetaAI. Actualízala desde Google Play para seguir cocinando.', { codigo: 'ACTUALIZAR' }, 426);
+    }
+    if (ipExcedida(req.ip)) {
+      return respuestaTexto(res, '⏳ Muchas recetas seguidas. Espera un rato e intenta de nuevo.', { codigo: 'FRENO' }, 429);
+    }
+    uid = typeof req.body.uid === 'string' ? req.body.uid.slice(0, 128) : null;
+  }
+
+  const exito = async (texto) => {
+    if (sesion && grupoId) {
+      try { await marcarExito(uid, grupoId); } catch (e) { console.log('No se pudo marcar éxito:', e.message); }
+    }
+    return res.json({ esError: false, contenido: [{ tipo: 'texto', texto }], uso: usoActual, grupo: grupoId });
+  };
+
+  try {
     if (uid) {
       const delBanco = await buscarEnBanco(uid, ingredients, categoria);
       if (delBanco) {
@@ -225,7 +501,7 @@ app.post('/api/receta', async (req, res) => {
         const { collection } = bankConfig(categoria);
         await db.collection(collection).doc(delBanco.id)
           .update({ timesServed: FieldValue.increment(1) });
-        return res.json({ esError: false, contenido: [{ tipo: 'texto', texto: delBanco.contenido }] });
+        return exito(delBanco.contenido);
       }
     }
 
@@ -256,18 +532,17 @@ app.post('/api/receta', async (req, res) => {
         } else {
           mensajeAmigable = "😅 Tuvimos un pequeño inconveniente generando tu receta. Intenta de nuevo en un momento.";
         }
-        return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: mensajeAmigable }] });
+        return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: mensajeAmigable }], uso: usoActual });
       }
 
       const candidato = d?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!candidato) {
-        return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: "😅 No pudimos generar tu receta esta vez. Intenta de nuevo en un momento." }] });
+        return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: "😅 No pudimos generar tu receta esta vez. Intenta de nuevo en un momento." }], uso: usoActual });
       }
 
       const nombre = extraerNombre(candidato);
 
       if (!uid) {
-        // Sin uid no podemos chequear el banco por usuario; se sirve directo (comportamiento viejo)
         texto = candidato;
         break;
       }
@@ -284,13 +559,87 @@ app.post('/api/receta', async (req, res) => {
     }
 
     if (!texto) {
-      return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: "😅 No pudimos generar una receta distinta esta vez. Intenta de nuevo en un momento." }] });
+      return res.json({ esError: true, contenido: [{ tipo: 'texto', texto: "😅 No pudimos generar una receta distinta esta vez. Intenta de nuevo en un momento." }], uso: usoActual });
     }
 
-    res.json({ esError: false, contenido: [{ tipo: 'texto', texto }] });
+    return exito(texto);
   } catch (mi) {
     console.log('ERROR CAPTURADO:', mi.message);
-    res.json({ esError: true, contenido: [{ tipo: 'texto', texto: '😅 Tuvimos un problema de conexión. Por favor intenta de nuevo en un momento.' }] });
+    res.json({ esError: true, contenido: [{ tipo: 'texto', texto: '😅 Tuvimos un problema de conexión. Por favor intenta de nuevo en un momento.' }], uso: usoActual });
+  }
+});
+
+// ---------- Consultar el uso del día (lo muestra la app) ----------
+app.get('/api/uso', async (req, res) => {
+  const sesion = await leerSesion(req);
+  if (!sesion || sesion.error) return res.status(401).json({ codigo: 'SESION' });
+  try {
+    const ilimitado = esDueno(sesion) || await esProReal(sesion.uid);
+    const ref = db.collection('usage').doc(sesion.uid);
+    const u = await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      const n = normalizarUso(snap.exists ? snap.data() : null);
+      t.set(ref, n);
+      return n;
+    });
+    res.json({ uso: usoPublico(u, ilimitado) });
+  } catch (e) {
+    console.log('Error en /api/uso:', e.message);
+    res.status(500).json({ codigo: 'ERROR' });
+  }
+});
+
+// ---------- Anuncio con recompensa: aviso desde la app (fase 1) ----------
+app.post('/api/anuncio-visto', async (req, res) => {
+  const sesion = await leerSesion(req);
+  if (!sesion || sesion.error) return res.status(401).json({ codigo: 'SESION' });
+  if (ANUNCIOS_VERIFICADOS) {
+    // Con AdMob SSV activo, la recompensa la da el aviso firmado de Google, no la app.
+    return res.json({ ok: true, verificado: true });
+  }
+  try {
+    const r = await sumarAnuncio(sesion.uid, null);
+    res.json(r);
+  } catch (e) {
+    console.log('Error en /api/anuncio-visto:', e.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// ---------- Anuncio con recompensa: aviso firmado por Google (AdMob SSV) ----------
+let clavesAdmob = { t: 0, claves: {} };
+async function obtenerClavesAdmob() {
+  if (Date.now() - clavesAdmob.t < 6 * 3600 * 1000 && Object.keys(clavesAdmob.claves).length) return clavesAdmob.claves;
+  const r = await fetch('https://www.gstatic.com/admob/reward/verifier-keys.json');
+  const d = await r.json();
+  const claves = {};
+  for (const k of d.keys || []) claves[String(k.keyId)] = k.pem;
+  clavesAdmob = { t: Date.now(), claves };
+  return claves;
+}
+
+app.get('/api/admob-ssv', async (req, res) => {
+  try {
+    const query = (req.originalUrl.split('?')[1]) || '';
+    const i = query.indexOf('&signature=');
+    if (i < 0) return res.status(200).send('ok'); // prueba de AdMob sin firma
+    const mensaje = query.slice(0, i);
+    const firma = req.query.signature;
+    const keyId = String(req.query.key_id || '');
+    const claves = await obtenerClavesAdmob();
+    const pem = claves[keyId];
+    const valida = !!pem && crypto.verify('sha256', Buffer.from(mensaje), pem, Buffer.from(String(firma), 'base64url'));
+    if (!valida) { console.log('SSV: firma inválida'); return res.status(200).send('ok'); }
+
+    const uid = String(req.query.user_id || '');
+    const tx = String(req.query.transaction_id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 100);
+    if (!uid || !tx) return res.status(200).send('ok'); // verificación de prueba o app vieja
+    const r = await sumarAnuncio(uid, tx);
+    console.log('SSV recompensa:', uid, r.ok ? 'sumada' : r.motivo);
+    res.status(200).send('ok');
+  } catch (e) {
+    console.log('Error en SSV:', e.message);
+    res.status(500).send('error'); // AdMob reintenta más tarde
   }
 });
 
