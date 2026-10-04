@@ -619,26 +619,36 @@ async function obtenerClavesAdmob() {
 }
 
 app.get('/api/admob-ssv', async (req, res) => {
+  const query = (req.originalUrl.split('?')[1]) || '';
+  console.log('SSV: aviso recibido de AdMob', query ? `(con ${query.split('&').length} datos)` : '(sin datos)');
+  let valida = false;
   try {
-    const query = (req.originalUrl.split('?')[1]) || '';
     const i = query.indexOf('&signature=');
     if (i < 0) return res.status(200).send('ok'); // prueba de AdMob sin firma
     const mensaje = query.slice(0, i);
-    const firma = req.query.signature;
+    const firma = String(req.query.signature || '');
     const keyId = String(req.query.key_id || '');
     const claves = await obtenerClavesAdmob();
     const pem = claves[keyId];
-    const valida = !!pem && crypto.verify('sha256', Buffer.from(mensaje), pem, Buffer.from(String(firma), 'base64url'));
-    if (!valida) { console.log('SSV: firma inválida'); return res.status(200).send('ok'); }
+    try {
+      valida = !!pem && crypto.verify('sha256', Buffer.from(mensaje), pem, Buffer.from(firma, 'base64url'));
+    } catch (e) { console.log('SSV: no se pudo comprobar la firma:', e.message); }
+    if (!valida) { console.log('SSV: firma inválida (key_id ' + keyId + ')'); return res.status(200).send('ok'); }
+  } catch (e) {
+    // Error al bajar las claves de Google: respondemos 200 igual para no bloquear la verificación.
+    console.log('SSV: error preparando la verificación:', e.message);
+    return res.status(200).send('ok');
+  }
 
-    const uid = String(req.query.user_id || '');
-    const tx = String(req.query.transaction_id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 100);
-    if (!uid || !tx) return res.status(200).send('ok'); // verificación de prueba o app vieja
+  const uid = String(req.query.user_id || '');
+  const tx = String(req.query.transaction_id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 100);
+  if (!uid || !tx) { console.log('SSV: firma válida (prueba de AdMob, sin usuario)'); return res.status(200).send('ok'); }
+  try {
     const r = await sumarAnuncio(uid, tx);
     console.log('SSV recompensa:', uid, r.ok ? 'sumada' : r.motivo);
     res.status(200).send('ok');
   } catch (e) {
-    console.log('Error en SSV:', e.message);
+    console.log('Error en SSV al guardar:', e.message);
     res.status(500).send('error'); // AdMob reintenta más tarde
   }
 });
